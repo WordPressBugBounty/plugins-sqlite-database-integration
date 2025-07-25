@@ -426,6 +426,31 @@ class WP_SQLite_Driver {
 	);
 
 	/**
+	 * A name-to-value map of MySQL system variables for the current session.
+	 *
+	 * MySQL session system variables are session-specific, so we can store them
+	 * in-memory. In SQL queries, they are combined with global system variables.
+	 *
+	 * See:
+	 *   https://dev.mysql.com/doc/refman/8.4/en/using-system-variables.html
+	 *
+	 * @var array<string, string>
+	 */
+	private $session_system_variables = array();
+
+	/**
+	 * A name-to-value map of MySQL user variables.
+	 *
+	 * MySQL user variables are session-specific, so we can store them in-memory.
+	 *
+	 * See:
+	 *   https://dev.mysql.com/doc/refman/8.4/en/user-variables.html
+	 *
+	 * @var array<string, string>
+	 */
+	private $user_variables = array();
+
+	/**
 	 * Constructor.
 	 *
 	 * Set up an SQLite connection and the MySQL-on-SQLite driver.
@@ -439,6 +464,11 @@ class WP_SQLite_Driver {
 		$this->connection   = $connection;
 		$this->main_db_name = $database;
 		$this->db_name      = $database;
+
+		// Check the database name.
+		if ( '' === $this->db_name ) {
+			throw $this->new_driver_exception( 'The database name cannot be empty.' );
+		}
 
 		// Check the SQLite version.
 		$sqlite_version = $this->get_sqlite_version();
@@ -474,7 +504,7 @@ class WP_SQLite_Driver {
 		);
 
 		// Ensure that the database is configured.
-		$migrator = new WP_SQLite_Configurator( $this, $this->information_schema_builder );
+		$migrator = new WP_SQLite_Configurator( $this->db_name, $this, $this->information_schema_builder );
 		$migrator->ensure_database_configured();
 
 		$this->connection->set_query_logger(
@@ -528,6 +558,32 @@ class WP_SQLite_Driver {
 		} catch ( PDOException $e ) {
 			if ( str_contains( $e->getMessage(), 'no such table' ) ) {
 				return $default_version;
+			}
+			throw $e;
+		}
+	}
+
+	/**
+	 * Get the database name saved in the database.
+	 *
+	 * The saved database name represents the database name that was used when
+	 * the database was initialized and configured.
+	 *
+	 * @return string The database name.
+	 * @throws PDOException When the query execution fails.
+	 */
+	public function get_saved_database_name(): string {
+		try {
+			$schemata_table = $this->information_schema_builder->get_table_name( false, 'schemata' );
+			return $this->execute_sqlite_query(
+				sprintf(
+					'SELECT SCHEMA_NAME FROM %s WHERE SCHEMA_NAME != "information_schema" LIMIT 1',
+					$this->quote_sqlite_identifier( $schemata_table )
+				)
+			)->fetchColumn() ?? '';
+		} catch ( PDOException $e ) {
+			if ( str_contains( $e->getMessage(), 'no such table' ) ) {
+				return '';
 			}
 			throw $e;
 		}
@@ -1563,6 +1619,9 @@ class WP_SQLite_Driver {
 		$keyword2 = $tokens[2] ?? null;
 
 		switch ( $keyword1->id ) {
+			case WP_MySQL_Lexer::DATABASES_SYMBOL:
+				$this->execute_show_databases_statement( $node );
+				break;
 			case WP_MySQL_Lexer::COLUMNS_SYMBOL:
 			case WP_MySQL_Lexer::FIELDS_SYMBOL:
 				$this->execute_show_columns_statement( $node );
@@ -1625,6 +1684,31 @@ class WP_SQLite_Driver {
 					)
 				);
 		}
+	}
+
+	/**
+	 * Translate and execute a MySQL SHOW DATABASES statement in SQLite.
+	 *
+	 * @param  WP_Parser_Node $node The "showStatement" AST node.
+	 */
+	private function execute_show_databases_statement( WP_Parser_Node $node ): void {
+		$schemata_table = $this->information_schema_builder->get_table_name( false, 'schemata' );
+
+		// LIKE and WHERE clauses.
+		$like_or_where = $node->get_first_child_node( 'likeOrWhere' );
+		if ( null !== $like_or_where ) {
+			$condition = $this->translate_show_like_or_where_condition( $like_or_where, 'schema_name' );
+		}
+
+		$databases = $this->execute_sqlite_query(
+			sprintf(
+				'SELECT SCHEMA_NAME AS Database FROM %s%s ORDER BY SCHEMA_NAME',
+				$this->quote_sqlite_identifier( $schemata_table ),
+				isset( $condition ) ? ( ' WHERE TRUE ' . $condition ) : ''
+			)
+		)->fetchAll( PDO::FETCH_OBJ );
+
+		$this->set_results_from_fetched_data( $databases );
 	}
 
 	/**
@@ -1713,7 +1797,7 @@ class WP_SQLite_Driver {
 		// LIKE and WHERE clauses.
 		$like_or_where = $node->get_first_child_node( 'likeOrWhere' );
 		if ( null !== $like_or_where ) {
-			$condition = $this->translate_show_like_or_where_condition( $like_or_where );
+			$condition = $this->translate_show_like_or_where_condition( $like_or_where, 'table_name' );
 		}
 
 		// Fetch table information.
@@ -1782,7 +1866,7 @@ class WP_SQLite_Driver {
 		// LIKE and WHERE clauses.
 		$like_or_where = $node->get_first_child_node( 'likeOrWhere' );
 		if ( null !== $like_or_where ) {
-			$condition = $this->translate_show_like_or_where_condition( $like_or_where );
+			$condition = $this->translate_show_like_or_where_condition( $like_or_where, 'table_name' );
 		}
 
 		// Fetch table information.
@@ -1867,7 +1951,7 @@ class WP_SQLite_Driver {
 		// LIKE and WHERE clauses.
 		$like_or_where = $node->get_first_child_node( 'likeOrWhere' );
 		if ( null !== $like_or_where ) {
-			$condition = $this->translate_show_like_or_where_condition( $like_or_where );
+			$condition = $this->translate_show_like_or_where_condition( $like_or_where, 'column_name' );
 		}
 
 		// Fetch column information.
@@ -2030,17 +2114,39 @@ class WP_SQLite_Driver {
 			}
 
 			if (
+				$part instanceof WP_MySQL_Token
+				&& WP_MySQL_Lexer::NAMES_SYMBOL === $part->id
+			) {
+				// "SET NAMES ..." is a no-op for now.
+				// TODO: Validate charset compatibility with UTF-8.
+				//       See: https://github.com/WordPress/sqlite-database-integration/issues/192
+			} elseif (
+				$part instanceof WP_Parser_Node
+				&& 'charsetClause' === $part->rule_name
+			) {
+				// "SET CHARACTER SET ..." is a no-op for now.
+				// TODO: Validate charset compatibility with UTF-8.
+				//       See: https://github.com/WordPress/sqlite-database-integration/issues/192
+			} elseif (
 				$part instanceof WP_Parser_Node
 				&& (
 					'internalVariableName' === $part->rule_name
 					|| 'setSystemVariable' === $part->rule_name
 				)
 			) {
+				// Set a system variable.
 				array_shift( $definition ); // Remove the '='.
 				$value = array_shift( $definition );
 				$this->execute_set_system_variable_statement( $part, $value, $default_type );
+			} elseif (
+				$part instanceof WP_Parser_Node
+				&& 'userVariable' === $part->rule_name
+			) {
+				// Set a user variable.
+				array_shift( $definition ); // Remove the '='.
+				$value = array_shift( $definition );
+				$this->execute_set_user_variable_statement( $part, $value );
 			} else {
-				// TODO: Support user variables (in-memory or a temporary table).
 				throw $this->new_not_supported_exception(
 					sprintf( 'SET statement: %s', $node->rule_name )
 				);
@@ -2082,15 +2188,55 @@ class WP_SQLite_Driver {
 			$type           = $var_ident_type->get_first_child_token()->id;
 		}
 
-		// Get the variable value.
-		$value = $this->translate( $value_node );
-		$value = str_replace( "''", "'", $value );
-		$value = substr( $value, 1, -1 );
+		/*
+		 * Some MySQL system variables values can be set using an unquoted pure
+		 * identifier rather than a string literal. This includes non-reserved
+		 * keywords. This is equivalent to using a corresponding string literal.
+		 *
+		 * For example, the following statement pairs are equivalent:
+		 *
+		 *   SET default_storage_engine = InnoDB
+		 *   SET default_storage_engine = 'InnoDB'
+		 *
+		 *   SET default_collation_for_utf8mb4 = utf8mb4_0900_ai_ci
+		 *   SET default_collation_for_utf8mb4 = 'utf8mb4_0900_ai_ci'
+		 *
+		 * In this cases, we need to use the value directly without attempting
+		 * to evaluate the expression, as that would result in a query error.
+		 * In the grammar, unquoted identifiers are captured by "columnRef".
+		 */
+		$identifier = $this->translate( $value_node->get_first_descendant_node( 'columnRef' ) );
+		if ( $identifier && $identifier === $this->translate( $value_node ) ) {
+			$value = $this->unquote_sqlite_identifier( $identifier );
+		} elseif ( ! $value_node->has_child_node( 'expr' ) ) {
+			$value = $this->unquote_sqlite_identifier( $this->translate( $value_node ) );
+		} else {
+			$value = $this->evaluate_expression( $value_node );
+		}
+
+		/*
+		 * Handle ON/OFF values. They are accepted as both strings and keywords.
+		 *
+		 * @TODO: This is actually variable-specific and depends on the its type.
+		 *        For example:
+		 *          SET autocommit = OFF;                   SELECT @@autocommit;                 -> 0
+		 *          SET autocommit = false;                 SELECT @@autocommit;                 -> 0
+		 *          SET session_track_gtids = OFF;          SELECT @@session_track_gtids;        -> OFF
+		 *          SET session_track_gtids = false;        SELECT @@session_track_gtids;        -> OFF
+		 *          SET updatable_views_with_limit = OFF;   ERROR 1231 (42000)
+		 *          SET updatable_views_with_limit = false; SELECT @@updatable_views_with_limit; -> NO
+		 */
+		$lowercase_value = strtolower( $value );
+		if ( 'on' === $lowercase_value || 'off' === $lowercase_value ) {
+			$value = 'on' === $lowercase_value ? 1 : 0;
+		}
 
 		if ( WP_MySQL_Lexer::SESSION_SYMBOL === $type ) {
 			if ( 'sql_mode' === $name ) {
 				$modes                  = explode( ',', strtoupper( $value ) );
 				$this->active_sql_modes = $modes;
+			} else {
+				$this->session_system_variables[ $name ] = $value;
 			}
 		} elseif ( WP_MySQL_Lexer::GLOBAL_SYMBOL === $type ) {
 			throw $this->new_not_supported_exception( "SET statement type: 'GLOBAL'" );
@@ -2101,6 +2247,26 @@ class WP_SQLite_Driver {
 		}
 
 		// TODO: Handle GLOBAL, PERSIST, and PERSIST_ONLY types.
+	}
+
+	/**
+	 * Translate and execute a MySQL SET statement for user variables.
+	 *
+	 * @param  WP_Parser_Node $user_variable The "userVariable" AST node.
+	 * @param  WP_Parser_Node $expr          The "expr" AST node.
+	 * @throws WP_SQLite_Driver_Exception    When the query execution fails.
+	 */
+	private function execute_set_user_variable_statement(
+		WP_Parser_Node $user_variable,
+		WP_Parser_Node $expr
+	): void {
+		$name  = $this->unquote_sqlite_identifier(
+			$this->translate( $user_variable->get_first_child() )
+		);
+		$name  = strtolower( substr( $name, 1 ) ); // Remove '@', normalize case.
+		$value = $this->evaluate_expression( $expr );
+
+		$this->user_variables[ $name ] = $value;
 	}
 
 	/**
@@ -2183,6 +2349,33 @@ class WP_SQLite_Driver {
 			);
 		}
 		$this->set_results_from_fetched_data( $results );
+	}
+
+	/**
+	 * Evaluate an expression and return the value, preserving its type.
+	 *
+	 * This is used to support expressions in SET statements for MySQL variables.
+	 *
+	 * @param  WP_Parser_Node $node The "expr" AST node.
+	 * @return mixed                The value of the expression.
+	 */
+	public function evaluate_expression( WP_Parser_Node $node ) {
+		// To support expressions, we'll use a SQLite query.
+		$stmt = $this->execute_sqlite_query(
+			sprintf( 'SELECT %s', $this->translate( $node ) )
+		);
+
+		// MySQL variables are typed, so we need to preserve the value type.
+		$value = $stmt->fetchColumn();
+		$type  = $stmt->getColumnMeta( 0 )['native_type'];
+		if ( 'null' === $type ) {
+			return null;
+		} elseif ( 'integer' === $type ) {
+			return (int) $value;
+		} elseif ( 'double' === $type ) {
+			return (float) $value;
+		}
+		return $value;
 	}
 
 	/**
@@ -2306,6 +2499,8 @@ class WP_SQLite_Driver {
 				throw $this->new_not_supported_exception(
 					sprintf( 'data type: %s', $child->get_value() )
 				);
+			case 'selectItem':
+				return $this->translate_select_item( $node );
 			case 'fromClause':
 				// FROM DUAL is MySQL-specific syntax that means "FROM no tables"
 				// and it is equivalent to omitting the FROM clause entirely.
@@ -2343,28 +2538,35 @@ class WP_SQLite_Driver {
 				$name = strtolower( $original_name );
 				$type = $type_token ? $type_token->id : WP_MySQL_Lexer::SESSION_SYMBOL;
 				if ( 'sql_mode' === $name ) {
-					$value = $this->connection->quote( implode( ',', $this->active_sql_modes ) );
+					$value = implode( ',', $this->active_sql_modes );
+				} elseif ( WP_MySQL_Lexer::SESSION_SYMBOL === $type ) {
+					$value = $this->session_system_variables[ $name ] ?? null;
 				} else {
 					// When we have no value, it's reasonable to use NULL.
-					$value = 'NULL';
+					$value = null;
 				}
 
 				// @TODO: Emulate more system variables, or use reasonable defaults.
 				//        See: https://dev.mysql.com/doc/refman/8.4/en/server-system-variable-reference.html
 				//        See: https://dev.mysql.com/doc/refman/8.4/en/server-system-variables.html
-
-				// TODO: Original name should come from the original MySQL input,
-				//       exactly as it was written by the user, and not translated.
-
-				// TODO: The '% AS %' syntax is compatible with SELECT lists only.
-				//       We need to translate it differently when used as a value.
-				return sprintf(
-					'%s AS %s',
-					$value,
-					$this->quote_sqlite_identifier(
-						'@@' . ( $type_token ? "{$type_token->get_value()}." : '' ) . $original_name
-					)
-				);
+				if ( null === $value ) {
+					return 'NULL';
+				}
+				if ( is_string( $value ) ) {
+					return $this->connection->quote( $value );
+				}
+				return (string) $value;
+			case 'userVariable':
+				$name  = $this->unquote_sqlite_identifier( $this->translate( $node->get_first_child() ) );
+				$name  = strtolower( substr( $name, 1 ) ); // Remove '@', normalize case.
+				$value = $this->user_variables[ $name ] ?? null;
+				if ( null === $value ) {
+					return 'NULL';
+				}
+				if ( is_string( $value ) ) {
+					return $this->connection->quote( $value );
+				}
+				return (string) $value;
 			case 'castType':
 				// Translate "CAST(... AS BINARY)" to "CAST(... AS BLOB)".
 				if ( $node->has_child_token( WP_MySQL_Lexer::BINARY_SYMBOL ) ) {
@@ -2821,15 +3023,11 @@ class WP_SQLite_Driver {
 			case 'CONCAT':
 				return '(' . implode( ' || ', $args ) . ')';
 			case 'FOUND_ROWS':
-				// @TODO: The following implementation with an alias assumes
-				//        that the function is used in the SELECT field list.
-				//        For compatibility with more complex use cases, it may
-				//        be better to register it as a custom SQLite function.
 				$found_rows = $this->last_sql_calc_found_rows;
 				if ( null === $found_rows && is_array( $this->last_result ) ) {
 					$found_rows = count( $this->last_result );
 				}
-				return sprintf( "(SELECT %d) AS 'FOUND_ROWS()'", $found_rows );
+				return $found_rows;
 			default:
 				return $this->translate_sequence( $node->get_children() );
 		}
@@ -2898,6 +3096,72 @@ class WP_SQLite_Driver {
 			}
 		}
 		return $value;
+	}
+
+	/**
+	 * Translate a select item to SQLite.
+	 *
+	 * In some cases, an explicit alias will be added to the select item, so that
+	 * the returned column name is always the same as it would be in MySQL.
+	 *
+	 * @param  WP_Parser_Node $node       The "selectItem" AST node.
+	 * @return string                     The translated expression.
+	 */
+	public function translate_select_item( WP_Parser_Node $node ): string {
+		/*
+		 * First, let's translate the select item subtree.
+		 *
+		 * [GRAMMAR]
+		 * selectItem: tableWild | (expr selectAlias?)
+		 */
+		$item = $this->translate_sequence( $node->get_children() );
+
+		// A table wildcard (e.g., "SELECT *, t.*, ...") never has an alias.
+		if ( $node->has_child_node( 'tableWild' ) ) {
+			return $item;
+		}
+
+		// When an explicit alias is provided, we can use it as is.
+		$alias = $node->get_first_child_node( 'selectAlias' );
+		if ( $alias ) {
+			return $item;
+		}
+
+		/*
+		 * When the select item contains only a column definition, we need to use
+		 * it without change, so that the returned column name reflects the real
+		 * column name in all cases, including when using a fully qualified name.
+		 *
+		 * For example, for "SELECT t.id", the column name in the result set will
+		 * only be "id", not "t.id", as it may appear based on the original query.
+		 *
+		 * In this case, SQLite uses the same logic as MySQL, so using the value
+		 * as is without adding an explicit alias will produce the correct result.
+		 */
+		$column_ref    = $node->get_first_descendant_node( 'columnRef' );
+		$is_column_ref = $column_ref && $item === $this->translate( $column_ref );
+		if ( $is_column_ref ) {
+			return $item;
+		}
+
+		/*
+		 * When the select item has no explicit alias, we need to ensure that the
+		 * returned column name is equivalent to what MySQL infers from the input.
+		 *
+		 * For example, if we translate "CONCAT('a', 'b')" to "('a' || 'b')", we
+		 * need to use the original "CONCAT('a', 'b')" string as the column name.
+		 * To achieve this, the select item will be translated as follows:
+		 *
+		 *   SELECT CONCAT('a', 'b') -> SELECT ('a' || 'b') AS `CONCAT('a', 'b')`
+		 */
+		$raw_alias = substr( $this->last_mysql_query, $node->get_start(), $node->get_length() );
+		$alias     = $this->quote_sqlite_identifier( $raw_alias );
+		if ( $alias === $item || $raw_alias === $item ) {
+			// For the simple case of selecting only columns ("SELECT id FROM t"),
+			// let's avoid unnecessary aliases ("SELECT `id` AS `id` FROM t").
+			return $item;
+		}
+		return sprintf( '%s AS %s', $item, $alias );
 	}
 
 	/**
@@ -3003,16 +3267,21 @@ class WP_SQLite_Driver {
 	 * Translate a MySQL SHOW LIKE ... or SHOW WHERE ... condition to SQLite.
 	 *
 	 * @param  WP_Parser_Node $like_or_where The "likeOrWhere" AST node.
+	 * @param  string         $like_column   The column name to use in the LIKE clause ("table_name", "column_name", etc.).
 	 * @return string                        The translated value.
 	 * @throws WP_SQLite_Driver_Exception    When the translation fails.
 	 */
-	private function translate_show_like_or_where_condition( WP_Parser_Node $like_or_where ): string {
+	private function translate_show_like_or_where_condition( WP_Parser_Node $like_or_where, string $like_column ): string {
 		$like_clause = $like_or_where->get_first_child_node( 'likeClause' );
 		if ( null !== $like_clause ) {
 			$value = $this->translate(
 				$like_clause->get_first_child_node( 'textStringLiteral' )
 			);
-			return sprintf( "AND table_name LIKE %s ESCAPE '\\'", $value );
+			return sprintf(
+				"AND %s LIKE %s ESCAPE '\\'",
+				$this->quote_sqlite_identifier( $like_column ),
+				$value
+			);
 		}
 
 		$where_clause = $like_or_where->get_first_child_node( 'whereClause' );
