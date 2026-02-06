@@ -26,12 +26,16 @@ class WP_SQLite_PDO_User_Defined_Functions {
 	 * Registers the user defined functions for SQLite to a PDO instance.
 	 * The functions are registered using PDO::sqliteCreateFunction().
 	 *
-	 * @param PDO $pdo The PDO object.
+	 * @param PDO|PDO\SQLite $pdo The PDO object.
 	 */
-	public static function register_for( PDO $pdo ): self {
+	public static function register_for( $pdo ): self {
 		$instance = new self();
 		foreach ( $instance->functions as $f => $t ) {
-			$pdo->sqliteCreateFunction( $f, array( $instance, $t ) );
+			if ( $pdo instanceof PDO\SQLite ) {
+				$pdo->createFunction( $f, array( $instance, $t ) );
+			} else {
+				$pdo->sqliteCreateFunction( $f, array( $instance, $t ) );
+			}
 		}
 		return $instance;
 	}
@@ -44,6 +48,7 @@ class WP_SQLite_PDO_User_Defined_Functions {
 	 * @var array
 	 */
 	private $functions = array(
+		'throw'                        => 'throw',
 		'month'                        => 'month',
 		'monthnum'                     => 'month',
 		'year'                         => 'year',
@@ -87,6 +92,18 @@ class WP_SQLite_PDO_User_Defined_Functions {
 		// Internal helper functions.
 		'_helper_like_to_glob_pattern' => '_helper_like_to_glob_pattern',
 	);
+
+	/**
+	 * A helper function to throw an error from SQLite expressions.
+	 *
+	 * @param string $message The error message.
+	 *
+	 * @throws Exception The error message.
+	 * @return void
+	 */
+	public function throw( $message ): void {
+		throw new Exception( $message );
+	}
 
 	/**
 	 * Method to return the unix timestamp.

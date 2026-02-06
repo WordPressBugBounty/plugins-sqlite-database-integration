@@ -9,6 +9,17 @@
  */
 class WP_SQLite_Information_Schema_Builder {
 	/**
+	 * The name of the database that is saved in the information schema tables.
+	 *
+	 * The SQLite driver injects the configured database name dynamically,
+	 * but we need to store some value in the information schema tables.
+	 * This database name will also be visible in SQLite admin tools.
+	 *
+	 * @var string
+	 */
+	const SAVED_DATABASE_NAME = 'sqlite_database';
+
+	/**
 	 * SQL definitions for tables that emulate MySQL "information_schema".
 	 *
 	 * The full MySQL information schema comprises a large number of tables:
@@ -22,10 +33,10 @@ class WP_SQLite_Information_Schema_Builder {
 	 *  - COLUMNS
 	 *  - STATISTICS (indexes)
 	 *  - TABLE_CONSTRAINTS
+	 *  - CHECK_CONSTRAINTS
 	 *
 	 * TODO (not yet implemented):
 	 *  - VIEWS
-	 *  - CHECK_CONSTRAINTS
 	 *  - TRIGGERS
 	 */
 	const INFORMATION_SCHEMA_TABLE_DEFINITIONS = array(
@@ -168,6 +179,15 @@ class WP_SQLite_Information_Schema_Builder {
 			REFERENCED_COLUMN_NAME TEXT COLLATE NOCASE,                    -- referenced column name
 			UNIQUE (CONSTRAINT_SCHEMA, CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_SCHEMA)
 		",
+
+		// INFORMATION_SCHEMA.CHECK_CONSTRAINTS
+		'check_constraints'       => "
+			CONSTRAINT_CATALOG TEXT NOT NULL DEFAULT 'def' COLLATE NOCASE, -- always 'def'
+			CONSTRAINT_SCHEMA TEXT NOT NULL COLLATE NOCASE,                -- constraint database name
+			CONSTRAINT_NAME TEXT NOT NULL COLLATE NOCASE,                  -- constraint name
+			CHECK_CLAUSE TEXT NOT NULL COLLATE BINARY,                     -- check clause
+			PRIMARY KEY (CONSTRAINT_SCHEMA, CONSTRAINT_NAME)
+		",
 	);
 
 	/**
@@ -291,17 +311,6 @@ class WP_SQLite_Information_Schema_Builder {
 	);
 
 	/**
-	 * Database name.
-	 *
-	 * @TODO: Consider passing the database name as a parameter to each method.
-	 *        This would expose an API that could support multiple databases
-	 *        in the future. Alternatively, it could be a stateful property.
-	 *
-	 * @var string
-	 */
-	private $db_name;
-
-	/**
 	 * A prefix for information schema table names.
 	 *
 	 * @var string
@@ -339,12 +348,10 @@ class WP_SQLite_Information_Schema_Builder {
 	/**
 	 * Constructor.
 	 *
-	 * @param string               $database        Database name.
 	 * @param string               $reserved_prefix An identifier prefix for internal database objects.
 	 * @param WP_SQLite_Connection $connection      An instance of the SQLite connection.
 	 */
-	public function __construct( string $database, string $reserved_prefix, WP_SQLite_Connection $connection ) {
-		$this->db_name                = $database;
+	public function __construct( string $reserved_prefix, WP_SQLite_Connection $connection ) {
 		$this->connection             = $connection;
 		$this->table_prefix           = $reserved_prefix . 'mysql_information_schema_';
 		$this->temporary_table_prefix = $reserved_prefix . 'mysql_information_schema_tmp_';
@@ -371,10 +378,10 @@ class WP_SQLite_Information_Schema_Builder {
 	public function temporary_table_exists( string $table_name ): bool {
 		/*
 		 * We could search in the "{$this->temporary_table_prefix}tables" table,
-		 * but it may not exist yet, so using "sqlite_temp_schema" is simpler.
+		 * but it may not exist yet, so using "sqlite_temp_master" is simpler.
 		 */
 		$stmt = $this->connection->query(
-			"SELECT 1 FROM sqlite_temp_schema WHERE type = 'table' AND name = ?",
+			"SELECT 1 FROM sqlite_temp_master WHERE type = 'table' AND name = ?",
 			array( $table_name )
 		);
 		return $stmt->fetchColumn() === '1';
@@ -385,15 +392,66 @@ class WP_SQLite_Information_Schema_Builder {
 	 * database. Tables that are missing will be created.
 	 */
 	public function ensure_information_schema_tables(): void {
+		$sqlite_version         = $this->connection->get_pdo()->getAttribute( PDO::ATTR_SERVER_VERSION ); // phpcs:ignore WordPress.DB.RestrictedClasses.mysql__PDO
+		$supports_strict_tables = version_compare( $sqlite_version, '3.37.0', '>=' );
 		foreach ( self::INFORMATION_SCHEMA_TABLE_DEFINITIONS as $table_name => $table_body ) {
 			$this->connection->query(
 				sprintf(
-					'CREATE TABLE IF NOT EXISTS %s%s (%s) STRICT',
+					'CREATE TABLE IF NOT EXISTS %s%s (%s)%s',
 					$this->table_prefix,
 					$table_name,
-					$table_body
+					$table_body,
+					$supports_strict_tables ? ' STRICT' : ''
 				)
 			);
+		}
+	}
+
+	/**
+	 * Get the definition and data of a computed information schema table.
+	 *
+	 * Some information schema tables can be computed on the fly when they are
+	 * referenced in a query. This method provides their definitions and data.
+	 *
+	 * @param  string $table_name The table name.
+	 * @return string|null        The table definition and data, or null if
+	 *                            the table is not a computed table.
+	 */
+	public function get_computed_information_schema_table_definition( string $table_name ): ?string {
+		switch ( strtolower( $table_name ) ) {
+			case 'character_sets':
+				return "SELECT
+						column1 AS CHARACTER_SET_NAME,
+						column2 AS DEFAULT_COLLATE_NAME,
+						column3 AS DESCRIPTION,
+						column4 AS MAXLEN
+					FROM (
+					VALUES
+						('binary', 'binary', 'Binary pseudo charset', 1),
+						('utf8', 'utf8_general_ci', 'UTF-8 Unicode', 3),
+						('utf8mb4', 'utf8mb4_0900_ai_ci', 'UTF-8 Unicode', 4)
+					)";
+			case 'collations':
+				return "SELECT
+					column1 AS COLLATION_NAME,
+					column2 AS CHARACTER_SET_NAME,
+					column3 AS ID,
+					column4 AS IS_DEFAULT,
+					column5 AS IS_COMPILED,
+					column6 AS SORTLEN,
+					column7 AS PAD_ATTRIBUTE
+				FROM (
+				VALUES
+					('binary', 'binary', 63, 'Yes', 'Yes', 1, 'NO PAD'),
+					('utf8_bin', 'utf8', 83, '', 'Yes', 1, 'PAD SPACE'),
+					('utf8_general_ci', 'utf8', 33, 'Yes', 'Yes', 1, 'PAD SPACE'),
+					('utf8_unicode_ci', 'utf8', 192, '', 'Yes', 8, 'PAD SPACE'),
+					('utf8mb4_bin', 'utf8mb4', 46, '', 'Yes', 1, 'PAD SPACE'),
+					('utf8mb4_unicode_ci', 'utf8mb4', 224, '', 'Yes', 8, 'PAD SPACE'),
+					('utf8mb4_0900_ai_ci', 'utf8mb4', 255, 'Yes', 'Yes', 0, 'NO PAD')
+				)";
+			default:
+				return null;
 		}
 	}
 
@@ -402,6 +460,8 @@ class WP_SQLite_Information_Schema_Builder {
 	 * the SQLite database. Tables that are missing will be created.
 	 */
 	public function ensure_temporary_information_schema_tables(): void {
+		$sqlite_version         = $this->connection->get_pdo()->getAttribute( PDO::ATTR_SERVER_VERSION ); // phpcs:ignore WordPress.DB.RestrictedClasses.mysql__PDO
+		$supports_strict_tables = version_compare( $sqlite_version, '3.37.0', '>=' );
 		foreach ( self::INFORMATION_SCHEMA_TABLE_DEFINITIONS as $table_name => $table_body ) {
 			// Skip the "schemata" table; MySQL doesn't support temporary databases.
 			if ( 'schemata' === $table_name ) {
@@ -410,10 +470,11 @@ class WP_SQLite_Information_Schema_Builder {
 
 			$this->connection->query(
 				sprintf(
-					'CREATE TEMPORARY TABLE IF NOT EXISTS %s%s (%s) STRICT',
+					'CREATE TEMPORARY TABLE IF NOT EXISTS %s%s (%s)%s',
 					$this->temporary_table_prefix,
 					$table_name,
-					$table_body
+					$table_body,
+					$supports_strict_tables ? ' STRICT' : ''
 				)
 			);
 		}
@@ -426,7 +487,8 @@ class WP_SQLite_Information_Schema_Builder {
 	 * @param WP_Parser_Node $node The "createStatement" AST node with "createTable" child.
 	 */
 	public function record_create_table( WP_Parser_Node $node ): void {
-		$table_name       = $this->get_value( $node->get_first_descendant_node( 'tableName' ) );
+		$table_name_node  = $node->get_first_descendant_node( 'tableName' );
+		$table_name       = $this->get_table_name_from_node( $table_name_node );
 		$table_engine     = $this->get_table_engine( $node );
 		$table_row_format = 'MyISAM' === $table_engine ? 'Fixed' : 'Dynamic';
 		$table_collation  = $this->get_table_collation( $node );
@@ -446,7 +508,7 @@ class WP_SQLite_Information_Schema_Builder {
 		// 1. Table.
 		$tables_table_name = $this->get_table_name( $table_is_temporary, 'tables' );
 		$table_data        = array(
-			'table_schema'    => $this->db_name,
+			'table_schema'    => self::SAVED_DATABASE_NAME,
 			'table_name'      => $table_name,
 			'table_type'      => 'BASE TABLE',
 			'engine'          => $table_engine,
@@ -531,6 +593,10 @@ class WP_SQLite_Information_Schema_Builder {
 				$table_name,
 				$index_data['index_name'] ?? null
 			);
+			$check_constraint_data       = $this->extract_check_constraint_data(
+				$column_node,
+				$table_name
+			);
 
 			// Save inline column constraints and indexes.
 			if ( null !== $index_data ) {
@@ -557,6 +623,12 @@ class WP_SQLite_Information_Schema_Builder {
 					$key_column_usage_item
 				);
 			}
+			if ( null !== $check_constraint_data ) {
+				$this->insert_values(
+					$this->get_table_name( $table_is_temporary, 'check_constraints' ),
+					$check_constraint_data
+				);
+			}
 
 			$column_position += 1;
 		}
@@ -573,7 +645,8 @@ class WP_SQLite_Information_Schema_Builder {
 	 * @param WP_Parser_Node $node The "alterStatement" AST node with "alterTable" child.
 	 */
 	public function record_alter_table( WP_Parser_Node $node ): void {
-		$table_name = $this->get_value( $node->get_first_descendant_node( 'tableRef' ) );
+		$table_ref  = $node->get_first_descendant_node( 'tableRef' );
+		$table_name = $this->get_table_name_from_node( $table_ref );
 		$actions    = $node->get_descendant_nodes( 'alterListItem' );
 
 		// Check if a temporary table with the given name exists.
@@ -663,6 +736,13 @@ class WP_SQLite_Information_Schema_Builder {
 					continue;
 				}
 
+				// DROP CHECK
+				if ( $action->has_child_token( WP_MySQL_Lexer::CHECK_SYMBOL ) ) {
+					$name = $this->get_value( $action->get_first_child_node( 'identifier' ) );
+					$this->record_drop_check_constraint( $table_is_temporary, $table_name, $name );
+					continue;
+				}
+
 				// DROP [COLUMN]
 				$column_ref = $action->get_first_child_node( 'fieldIdentifier' );
 				if ( null !== $column_ref ) {
@@ -693,34 +773,34 @@ class WP_SQLite_Information_Schema_Builder {
 
 		$table_refs = $child_node->get_first_child_node( 'tableRefList' )->get_child_nodes();
 		foreach ( $table_refs as $table_ref ) {
-			$table_name         = $this->get_value( $table_ref );
+			$table_name         = $this->get_table_name_from_node( $table_ref );
 			$table_is_temporary = $has_temporary_keyword || $this->temporary_table_exists( $table_name );
 
 			$this->delete_values(
 				$this->get_table_name( $table_is_temporary, 'tables' ),
 				array(
-					'table_schema' => $this->db_name,
+					'table_schema' => self::SAVED_DATABASE_NAME,
 					'table_name'   => $table_name,
 				)
 			);
 			$this->delete_values(
 				$this->get_table_name( $table_is_temporary, 'columns' ),
 				array(
-					'table_schema' => $this->db_name,
+					'table_schema' => self::SAVED_DATABASE_NAME,
 					'table_name'   => $table_name,
 				)
 			);
 			$this->delete_values(
 				$this->get_table_name( $table_is_temporary, 'statistics' ),
 				array(
-					'table_schema' => $this->db_name,
+					'table_schema' => self::SAVED_DATABASE_NAME,
 					'table_name'   => $table_name,
 				)
 			);
 			$this->delete_values(
 				$this->get_table_name( $table_is_temporary, 'table_constraints' ),
 				array(
-					'table_schema' => $this->db_name,
+					'table_schema' => self::SAVED_DATABASE_NAME,
 					'table_name'   => $table_name,
 				)
 			);
@@ -737,7 +817,8 @@ class WP_SQLite_Information_Schema_Builder {
 	public function record_create_index( WP_Parser_Node $node ): void {
 		$create_index = $node->get_first_child_node( 'createIndex' );
 		$target       = $create_index->get_first_child_node( 'createIndexTarget' );
-		$table_name   = $this->get_value( $target->get_first_child_node( 'tableRef' ) );
+		$table_ref    = $target->get_first_child_node( 'tableRef' );
+		$table_name   = $this->get_table_name_from_node( $table_ref );
 
 		$table_is_temporary = $this->temporary_table_exists( $table_name );
 		$this->record_add_index( $table_is_temporary, $table_name, $create_index );
@@ -750,7 +831,8 @@ class WP_SQLite_Information_Schema_Builder {
 	 */
 	public function record_drop_index( WP_Parser_Node $node ): void {
 		$drop_index         = $node->get_first_child_node( 'dropIndex' );
-		$table_name         = $this->get_value( $drop_index->get_first_child_node( 'tableRef' ) );
+		$table_ref          = $drop_index->get_first_child_node( 'tableRef' );
+		$table_name         = $this->get_table_name_from_node( $table_ref );
 		$index_name         = $this->get_value( $drop_index->get_first_child_node( 'indexRef' ) );
 		$table_is_temporary = $this->temporary_table_exists( $table_name );
 		$this->record_drop_index_data( $table_is_temporary, $table_name, $index_name );
@@ -778,7 +860,7 @@ class WP_SQLite_Information_Schema_Builder {
 				WHERE table_schema = ?
 				AND table_name = ?
 			',
-			array( $this->db_name, $table_name )
+			array( self::SAVED_DATABASE_NAME, $table_name )
 		)->fetchColumn();
 
 		$column_data = $this->extract_column_data( $table_name, $column_name, $node, (int) $position + 1 );
@@ -837,7 +919,7 @@ class WP_SQLite_Information_Schema_Builder {
 			$this->get_table_name( $table_is_temporary, 'columns' ),
 			$column_data,
 			array(
-				'table_schema' => $this->db_name,
+				'table_schema' => self::SAVED_DATABASE_NAME,
 				'table_name'   => $table_name,
 				'column_name'  => $column_name,
 			)
@@ -851,7 +933,7 @@ class WP_SQLite_Information_Schema_Builder {
 					'column_name' => $new_column_name,
 				),
 				array(
-					'table_schema' => $this->db_name,
+					'table_schema' => self::SAVED_DATABASE_NAME,
 					'table_name'   => $table_name,
 					'column_name'  => $column_name,
 				)
@@ -920,7 +1002,7 @@ class WP_SQLite_Information_Schema_Builder {
 		$this->delete_values(
 			$this->get_table_name( $table_is_temporary, 'columns' ),
 			array(
-				'table_schema' => $this->db_name,
+				'table_schema' => self::SAVED_DATABASE_NAME,
 				'table_name'   => $table_name,
 				'column_name'  => $column_name,
 			)
@@ -962,7 +1044,7 @@ class WP_SQLite_Information_Schema_Builder {
 		$this->delete_values(
 			$statistics_table,
 			array(
-				'table_schema' => $this->db_name,
+				'table_schema' => self::SAVED_DATABASE_NAME,
 				'table_name'   => $table_name,
 				'column_name'  => $column_name,
 			)
@@ -976,22 +1058,21 @@ class WP_SQLite_Information_Schema_Builder {
 		 */
 		$this->connection->query(
 			sprintf(
-				'UPDATE %s AS statistics
-				SET seq_in_index = renumbered.seq_in_index
-				FROM (
+				'WITH renumbered AS (
 					SELECT
 						rowid,
 						row_number() OVER (PARTITION BY index_name ORDER BY seq_in_index) AS seq_in_index
 					FROM %s
 					WHERE table_schema = ?
 					AND table_name = ?
-				) AS renumbered
-				WHERE statistics.rowid = renumbered.rowid
-				AND statistics.seq_in_index != renumbered.seq_in_index',
+				)
+				UPDATE %s AS statistics
+				SET seq_in_index = (SELECT seq_in_index FROM renumbered WHERE rowid = statistics.rowid)
+				WHERE statistics.rowid IN (SELECT rowid FROM renumbered)',
 				$this->connection->quote_identifier( $statistics_table ),
 				$this->connection->quote_identifier( $statistics_table )
 			),
-			array( $this->db_name, $table_name )
+			array( self::SAVED_DATABASE_NAME, $table_name )
 		);
 
 		/*
@@ -1022,7 +1103,7 @@ class WP_SQLite_Information_Schema_Builder {
 				$this->connection->quote_identifier( $constraints_table ),
 				$this->connection->quote_identifier( $statistics_table )
 			),
-			array( $this->db_name, $table_name, $this->db_name, $table_name )
+			array( self::SAVED_DATABASE_NAME, $table_name, self::SAVED_DATABASE_NAME, $table_name )
 		);
 	}
 
@@ -1118,7 +1199,7 @@ class WP_SQLite_Information_Schema_Builder {
 		$this->delete_values(
 			$this->get_table_name( $table_is_temporary, 'statistics' ),
 			array(
-				'table_schema' => $this->db_name,
+				'table_schema' => self::SAVED_DATABASE_NAME,
 				'table_name'   => $table_name,
 				'index_name'   => $index_name,
 			)
@@ -1142,7 +1223,7 @@ class WP_SQLite_Information_Schema_Builder {
 		$this->delete_values(
 			$this->get_table_name( $table_is_temporary, 'table_constraints' ),
 			array(
-				'table_schema'    => $this->db_name,
+				'table_schema'    => self::SAVED_DATABASE_NAME,
 				'table_name'      => $table_name,
 				'constraint_name' => $index_name,
 				'constraint_type' => $constraint_type,
@@ -1167,14 +1248,13 @@ class WP_SQLite_Information_Schema_Builder {
 	): void {
 		// Get first constraint keyword.
 		$children = $node->get_children();
-		$keyword  = $children[0] instanceof WP_MySQL_Token ? $children[0] : $children[1];
+		if ( $children[0] instanceof WP_Parser_Node && 'constraintName' === $children[0]->rule_name ) {
+			$keyword = $children[1];
+		} else {
+			$keyword = $children[0];
+		}
 		if ( ! $keyword instanceof WP_MySQL_Token ) {
 			$keyword = $keyword->get_first_child_token();
-		}
-
-		// CHECK constraints are not supported yet.
-		if ( WP_MySQL_Lexer::CHECK_SYMBOL === $keyword->id ) {
-			throw new \Exception( 'CHECK constraints are not supported yet.' );
 		}
 
 		// PRIMARY KEY and UNIQUE require an index.
@@ -1208,6 +1288,7 @@ class WP_SQLite_Information_Schema_Builder {
 		$constraint_data             = $this->extract_table_constraint_data( $node, $table_name, $index_name );
 		$referential_constraint_data = $this->extract_referential_constraint_data( $node, $table_name );
 		$key_column_usage_data       = $this->extract_key_column_usage_data( $node, $table_name, $index_name );
+		$check_constraint_data       = $this->extract_check_constraint_data( $node, $table_name );
 
 		// Save constraint data.
 		if ( null !== $constraint_data ) {
@@ -1230,6 +1311,13 @@ class WP_SQLite_Information_Schema_Builder {
 				$key_column_usage_item
 			);
 		}
+
+		if ( null !== $check_constraint_data ) {
+			$this->insert_values(
+				$this->get_table_name( $table_is_temporary, 'check_constraints' ),
+				$check_constraint_data
+			);
+		}
 	}
 
 	/**
@@ -1250,7 +1338,7 @@ class WP_SQLite_Information_Schema_Builder {
 				$this->connection->quote_identifier( $this->get_table_name( $table_is_temporary, 'table_constraints' ) )
 			),
 			array(
-				$this->db_name,
+				self::SAVED_DATABASE_NAME,
 				$table_name,
 				$name,
 			)
@@ -1275,6 +1363,8 @@ class WP_SQLite_Information_Schema_Builder {
 			$this->record_drop_key( $table_is_temporary, $table_name, $name );
 		} elseif ( 'FOREIGN KEY' === $constraint_type ) {
 			$this->record_drop_foreign_key( $table_is_temporary, $table_name, $name );
+		} elseif ( 'CHECK' === $constraint_type ) {
+			$this->record_drop_check_constraint( $table_is_temporary, $table_name, $name );
 		} else {
 			throw new \Exception(
 				"DROP CONSTRAINT for constraint type '$constraint_type' is not supported."
@@ -1298,7 +1388,7 @@ class WP_SQLite_Information_Schema_Builder {
 		$this->delete_values(
 			$this->get_table_name( $table_is_temporary, 'table_constraints' ),
 			array(
-				'TABLE_SCHEMA'    => $this->db_name,
+				'TABLE_SCHEMA'    => self::SAVED_DATABASE_NAME,
 				'TABLE_NAME'      => $table_name,
 				'CONSTRAINT_NAME' => $name,
 			)
@@ -1307,7 +1397,7 @@ class WP_SQLite_Information_Schema_Builder {
 		$this->delete_values(
 			$this->get_table_name( $table_is_temporary, 'statistics' ),
 			array(
-				'TABLE_SCHEMA' => $this->db_name,
+				'TABLE_SCHEMA' => self::SAVED_DATABASE_NAME,
 				'TABLE_NAME'   => $table_name,
 				'INDEX_NAME'   => $name,
 			)
@@ -1316,7 +1406,7 @@ class WP_SQLite_Information_Schema_Builder {
 		$this->delete_values(
 			$this->get_table_name( $table_is_temporary, 'key_column_usage' ),
 			array(
-				'TABLE_SCHEMA'            => $this->db_name,
+				'TABLE_SCHEMA'            => self::SAVED_DATABASE_NAME,
 				'TABLE_NAME'              => $table_name,
 				'CONSTRAINT_NAME'         => $name,
 
@@ -1344,7 +1434,7 @@ class WP_SQLite_Information_Schema_Builder {
 		$this->delete_values(
 			$this->get_table_name( $table_is_temporary, 'table_constraints' ),
 			array(
-				'TABLE_SCHEMA'    => $this->db_name,
+				'TABLE_SCHEMA'    => self::SAVED_DATABASE_NAME,
 				'TABLE_NAME'      => $table_name,
 				'CONSTRAINT_NAME' => $name,
 			)
@@ -1353,7 +1443,7 @@ class WP_SQLite_Information_Schema_Builder {
 		$this->delete_values(
 			$this->get_table_name( $table_is_temporary, 'referential_constraints' ),
 			array(
-				'CONSTRAINT_SCHEMA' => $this->db_name,
+				'CONSTRAINT_SCHEMA' => self::SAVED_DATABASE_NAME,
 				'TABLE_NAME'        => $table_name,
 				'CONSTRAINT_NAME'   => $name,
 			)
@@ -1362,12 +1452,43 @@ class WP_SQLite_Information_Schema_Builder {
 		$this->delete_values(
 			$this->get_table_name( $table_is_temporary, 'key_column_usage' ),
 			array(
-				'TABLE_SCHEMA'            => $this->db_name,
+				'TABLE_SCHEMA'            => self::SAVED_DATABASE_NAME,
 				'TABLE_NAME'              => $table_name,
 				'CONSTRAINT_NAME'         => $name,
 
 				// Remove only FOREIGN KEY records; not PRIMARY/UNIQUE KEY data.
-				'REFERENCED_TABLE_SCHEMA' => $this->db_name,
+				'REFERENCED_TABLE_SCHEMA' => self::SAVED_DATABASE_NAME,
+			)
+		);
+	}
+
+	/**
+	 * Analyze DROP CHECK statement and record data in the information schema.
+	 *
+	 * @param bool   $table_is_temporary Whether the table is temporary.
+	 * @param string $table_name         The table name.
+	 * @param string $name               The check constraint name.
+	 */
+	private function record_drop_check_constraint(
+		bool $table_is_temporary,
+		string $table_name,
+		string $name
+	): void {
+		$this->delete_values(
+			$this->get_table_name( $table_is_temporary, 'table_constraints' ),
+			array(
+				'CONSTRAINT_SCHEMA' => self::SAVED_DATABASE_NAME,
+				'TABLE_NAME'        => $table_name,
+				'CONSTRAINT_TYPE'   => 'CHECK',
+				'CONSTRAINT_NAME'   => $name,
+			)
+		);
+
+		$this->delete_values(
+			$this->get_table_name( $table_is_temporary, 'check_constraints' ),
+			array(
+				'CONSTRAINT_SCHEMA' => self::SAVED_DATABASE_NAME,
+				'CONSTRAINT_NAME'   => $name,
 			)
 		);
 	}
@@ -1396,7 +1517,7 @@ class WP_SQLite_Information_Schema_Builder {
 		$generation_expression               = $this->get_column_generation_expression( $node );
 
 		return array(
-			'table_schema'             => $this->db_name,
+			'table_schema'             => self::SAVED_DATABASE_NAME,
 			'table_name'               => $table_name,
 			'column_name'              => $column_name,
 			'ordinal_position'         => $position,
@@ -1441,10 +1562,10 @@ class WP_SQLite_Information_Schema_Builder {
 		if ( $has_inline_primary_key || $has_inline_unique_key ) {
 			$index_name = $has_inline_primary_key ? 'PRIMARY' : $column_name;
 			return array(
-				'table_schema'  => $this->db_name,
+				'table_schema'  => self::SAVED_DATABASE_NAME,
 				'table_name'    => $table_name,
 				'non_unique'    => 0,
-				'index_schema'  => $this->db_name,
+				'index_schema'  => self::SAVED_DATABASE_NAME,
 				'index_name'    => $index_name,
 				'seq_in_index'  => 1,
 				'column_name'   => $column_name,
@@ -1512,7 +1633,7 @@ class WP_SQLite_Information_Schema_Builder {
 					AND table_name = ?
 					AND column_name IN (' . implode( ',', array_fill( 0, count( $column_names ), '?' ) ) . ')
 				',
-				array_merge( array( $this->db_name, $table_name ), $column_names )
+				array_merge( array( self::SAVED_DATABASE_NAME, $table_name ), $column_names )
 			)->fetchAll(
 				PDO::FETCH_ASSOC // phpcs:ignore WordPress.DB.RestrictedClasses.mysql__PDO
 			);
@@ -1561,10 +1682,10 @@ class WP_SQLite_Information_Schema_Builder {
 			);
 
 			$statistics_data[] = array(
-				'table_schema'  => $this->db_name,
+				'table_schema'  => self::SAVED_DATABASE_NAME,
 				'table_name'    => $table_name,
 				'non_unique'    => $non_unique,
-				'index_schema'  => $this->db_name,
+				'index_schema'  => self::SAVED_DATABASE_NAME,
 				'index_name'    => $index_name,
 				'seq_in_index'  => $seq_in_index,
 				'column_name'   => $column_name,
@@ -1605,12 +1726,22 @@ class WP_SQLite_Information_Schema_Builder {
 
 		// Index name always takes precedence over constraint name.
 		$name = $index_name ?? $this->get_table_constraint_name( $node, $table_name );
+
+		// Constraint enforcement.
+		$constraint_enforcement = $node->get_first_descendant_node( 'constraintEnforcement' );
+		if ( $constraint_enforcement && $constraint_enforcement->has_child_token( WP_MySQL_Lexer::NOT_SYMBOL ) ) {
+			$enforced = 'NO';
+		} else {
+			$enforced = 'YES';
+		}
+
 		return array(
-			'table_schema'      => $this->db_name,
+			'table_schema'      => self::SAVED_DATABASE_NAME,
 			'table_name'        => $table_name,
-			'constraint_schema' => $this->db_name,
+			'constraint_schema' => self::SAVED_DATABASE_NAME,
 			'constraint_name'   => $name,
 			'constraint_type'   => $type,
+			'enforced'          => $enforced,
 		);
 	}
 
@@ -1628,9 +1759,8 @@ class WP_SQLite_Information_Schema_Builder {
 		}
 
 		// Referenced table name.
-		$referenced_table       = $references->get_first_child_node( 'tableRef' );
-		$referenced_identifiers = $referenced_table->get_descendant_nodes( 'identifier' );
-		$referenced_table_name  = $this->get_value( end( $referenced_identifiers ) );
+		$referenced_table      = $references->get_first_child_node( 'tableRef' );
+		$referenced_table_name = $this->get_table_name_from_node( $referenced_table );
 
 		// Referenced column names.
 		$reference_parts = $references->get_first_child_node( 'identifierListWithParentheses' )
@@ -1654,7 +1784,7 @@ class WP_SQLite_Information_Schema_Builder {
 				AND non_unique = 0
 				ORDER BY index_name = 'PRIMARY' DESC, index_name, seq_in_index
 			",
-			array( $this->db_name, $referenced_table_name )
+			array( self::SAVED_DATABASE_NAME, $referenced_table_name )
 		)->fetchAll(
 			PDO::FETCH_ASSOC // phpcs:ignore WordPress.DB.RestrictedClasses.mysql__PDO
 		);
@@ -1683,9 +1813,9 @@ class WP_SQLite_Information_Schema_Builder {
 
 		$name = $this->get_table_constraint_name( $node, $table_name );
 		return array(
-			'constraint_schema'        => $this->db_name,
+			'constraint_schema'        => self::SAVED_DATABASE_NAME,
 			'constraint_name'          => $name,
-			'unique_constraint_schema' => $this->db_name,
+			'unique_constraint_schema' => self::SAVED_DATABASE_NAME,
 			'unique_constraint_name'   => $unique_constraint_name,
 			'update_rule'              => $on_update,
 			'delete_rule'              => $on_delete,
@@ -1720,8 +1850,8 @@ class WP_SQLite_Information_Schema_Builder {
 			$referenced_identifiers  = $referenced_table->get_descendant_nodes( 'identifier' );
 			$referenced_table_schema = count( $referenced_identifiers ) > 1
 				? $this->get_value( $referenced_identifiers[0] )
-				: $this->db_name;
-			$referenced_table_name   = $this->get_value( end( $referenced_identifiers ) );
+				: self::SAVED_DATABASE_NAME;
+			$referenced_table_name   = $this->get_table_name_from_node( $referenced_table );
 			$referenced_columns      = $references->get_first_child_node( 'identifierListWithParentheses' )
 				->get_first_child_node( 'identifierList' )
 				->get_child_nodes( 'identifier' );
@@ -1753,9 +1883,9 @@ class WP_SQLite_Information_Schema_Builder {
 			$position    = $i + 1;
 
 			$rows[] = array(
-				'constraint_schema'             => $this->db_name,
+				'constraint_schema'             => self::SAVED_DATABASE_NAME,
 				'constraint_name'               => $name,
-				'table_schema'                  => $this->db_name,
+				'table_schema'                  => self::SAVED_DATABASE_NAME,
 				'table_name'                    => $table_name,
 				'column_name'                   => $column_name,
 				'ordinal_position'              => $position,
@@ -1766,6 +1896,29 @@ class WP_SQLite_Information_Schema_Builder {
 			);
 		}
 		return $rows;
+	}
+
+	/**
+	 * Extract check constraint data from the "tableConstraintDef" AST node.
+	 *
+	 * @param  WP_Parser_Node $node       The "tableConstraintDef" AST node.
+	 * @param  string         $table_name The table name.
+	 * @return array|null                 The check constraint data as stored in information schema.
+	 */
+	private function extract_check_constraint_data( WP_Parser_Node $node, string $table_name ): ?array {
+		$check_constraint = $node->get_first_descendant_node( 'checkConstraint' );
+		if ( null === $check_constraint ) {
+			return null;
+		}
+
+		$expr         = $check_constraint->get_first_child_node( 'exprWithParentheses' );
+		$check_clause = $this->serialize_mysql_expression( $expr );
+
+		return array(
+			'constraint_schema' => self::SAVED_DATABASE_NAME,
+			'constraint_name'   => $this->get_table_constraint_name( $node, $table_name ),
+			'check_clause'      => $check_clause,
+		);
 	}
 
 	/**
@@ -1812,7 +1965,24 @@ class WP_SQLite_Information_Schema_Builder {
 			    WHERE c.table_schema = ?
 			    AND c.table_name = ?
 			',
-			array( $this->db_name, $table_name )
+			array( self::SAVED_DATABASE_NAME, $table_name )
+		);
+	}
+
+	/**
+	 * Extract table name from one of fully-qualified name AST nodes.
+	 *
+	 * @param  WP_Parser_Node $node The AST node. One of "tableName" or "tableRef".
+	 * @return string               The table name.
+	 */
+	private function get_table_name_from_node( WP_Parser_Node $node ): string {
+		if ( 'tableRef' === $node->rule_name || 'tableName' === $node->rule_name ) {
+			$parts = $node->get_descendant_nodes( 'identifier' );
+			return $this->get_value( end( $parts ) );
+		}
+
+		throw new Exception(
+			sprintf( 'Could not get table name from node: %s', $node->rule_name )
 		);
 	}
 
@@ -1885,20 +2055,48 @@ class WP_SQLite_Information_Schema_Builder {
 			return null;
 		}
 
+		/*
+		 * [GRAMMAR]
+		 * DEFAULT_SYMBOL (
+		 *    signedLiteral
+		 *    | NOW_SYMBOL timeFunctionParameters?
+		 *    | {serverVersion >= 80013}? exprWithParentheses
+		 * )
+		 */
+
+		// DEFAULT NOW()
 		if ( $default_attr->has_child_token( WP_MySQL_Lexer::NOW_SYMBOL ) ) {
 			return 'CURRENT_TIMESTAMP';
 		}
 
-		if (
-			$default_attr->has_child_node( 'signedLiteral' )
-			&& null !== $default_attr->get_first_descendant_node( 'nullLiteral' )
-		) {
-			return null;
+		// DEFAULT signedLiteral
+		$signed_literal = $default_attr->get_first_child_node( 'signedLiteral' );
+		if ( $signed_literal ) {
+			$literal = $signed_literal->get_first_child_node( 'literal' );
+
+			// DEFAULT NULL
+			if ( $literal && $literal->has_child_node( 'nullLiteral' ) ) {
+				return null;
+			}
+
+			// DEFAULT TRUE or DEFAULT FALSE
+			if ( $literal && $literal->has_child_node( 'boolLiteral' ) ) {
+				$bool_literal = $literal->get_first_child_node( 'boolLiteral' );
+				return $bool_literal->has_child_token( WP_MySQL_Lexer::TRUE_SYMBOL ) ? '1' : '0';
+			}
+
+			// @TODO: MySQL seems to normalize default values for numeric
+			//        columns, such as 1.0 to 1, 1e3 to 1000, etc.
+			return $this->get_value( $signed_literal );
 		}
 
-		// @TODO: MySQL seems to normalize default values for numeric
-		//        columns, such as 1.0 to 1, 1e3 to 1000, etc.
-		return $this->get_value( $default_attr->get_first_child_node() );
+		// DEFAULT (expression) - MySQL 8.0.13+ supports exprWithParentheses
+		$expr_with_parens = $default_attr->get_first_child_node( 'exprWithParentheses' );
+		if ( $expr_with_parens ) {
+			return $this->serialize_mysql_expression( $expr_with_parens );
+		}
+
+		throw new Exception( 'DEFAULT value of this type is not supported.' );
 	}
 
 	/**
@@ -2431,9 +2629,14 @@ class WP_SQLite_Information_Schema_Builder {
 			return $this->get_value( $name_node->get_first_child_node( 'identifier' ) );
 		}
 
-		// FOREIGN KEY constraint without a name gets a generated name.
-		if ( $node->get_first_descendant_node( 'references' ) ) {
-			// Get the highest existing name in format "<table_name>_ibfk_<number>".
+		$foreign_key      = $node->get_first_descendant_node( 'references' );
+		$check_constraint = $node->get_first_descendant_node( 'checkConstraint' );
+
+		// FOREIGN KEY and CHECK constraints without a name get a generated name.
+		if ( $foreign_key || $check_constraint ) {
+			$type = $check_constraint ? 'chk' : 'ibfk';
+
+			// Get the highest existing name in format "<table_name>_<type>_<number>".
 			$existing_names = $this->connection->query(
 				sprintf(
 					"SELECT DISTINCT constraint_name
@@ -2449,9 +2652,9 @@ class WP_SQLite_Information_Schema_Builder {
 					)
 				),
 				array(
-					$this->db_name,
+					self::SAVED_DATABASE_NAME,
 					$table_name,
-					str_replace( array( '_', '%' ), array( '\\_', '\\%' ), $table_name ) . '\\_ibfk\\_%',
+					str_replace( array( '_', '%' ), array( '\\_', '\\%' ), $table_name ) . "\\_{$type}\\_%",
 				)
 			)->fetchAll(
 				PDO::FETCH_COLUMN // phpcs:ignore WordPress.DB.RestrictedClasses.mysql__PDO
@@ -2465,10 +2668,9 @@ class WP_SQLite_Information_Schema_Builder {
 					$last_name_index = (int) max( $last_name_index, (int) $last_part );
 				}
 			}
-			return $table_name . '_ibfk_' . ( $last_name_index + 1 );
+			return $table_name . "_{$type}_" . ( $last_name_index + 1 );
 		}
 
-		// TODO: Handle CHECK constraints.
 		return null;
 	}
 
@@ -2548,7 +2750,7 @@ class WP_SQLite_Information_Schema_Builder {
 					)
 				),
 				array(
-					$this->db_name,
+					self::SAVED_DATABASE_NAME,
 					$table_name,
 					$name,
 					str_replace( array( '_', '%' ), array( '\\_', '\\%' ), $name ) . '\\_%',
@@ -2815,6 +3017,56 @@ class WP_SQLite_Information_Schema_Builder {
 			$full_value .= $value;
 		}
 		return $full_value;
+	}
+
+	/**
+	 * Serialize a MySQL expression for storing in the information schema.
+	 *
+	 * This is used for storing DEFAULT and CHECK expressions in the database.
+	 *
+	 * The current implementation is using a naive approach based on directly
+	 * joining the original expression token bytes. This is safe, beacuase the
+	 * original tokens must comprise a valid expression. While functionally
+	 * equivalent, it is not strictly identical to what MySQL stores, because
+	 * MySQL normalizes and prints the expression in a specific format.
+	 *
+	 * TODO: Consider implementing a MySQL expression node -> string formatter
+	 *       that would produce results that are identical to MySQL formatting.
+	 *       This gets tricky from MySQL 8, where a double-escaping regression
+	 *       was introduced, storing strings like "_utf8mb4\'abc\'" instead of
+	 *       "_utf8mb4'abc'", but displaying them correctly in SHOW statements.
+	 *       @see https://bugs.mysql.com/bug.php?id=100607
+	 *
+	 * @param  WP_Parser_Node $node The AST node that needs to be serialized.
+	 * @return string               The serialized value of the node.
+	 */
+	private function serialize_mysql_expression( WP_Parser_Node $node ): string {
+		// The wrapping parentheses are generally not stored, although in MySQL,
+		// this varies by expression type as per the expression formatter logic.
+		if ( 'exprWithParentheses' === $node->rule_name ) {
+			return $this->serialize_mysql_expression( $node->get_first_child_node( 'expr' ) );
+		}
+
+		$value         = '';
+		$last_token_id = null;
+		foreach ( $node->get_descendant_tokens() as $i => $token ) {
+			// Do not insert whitespace around parentheses. This is primarily to
+			// avoid inserting whitespace before '(', which may break function
+			// calls, depending on the value of the "IGNORE_SPACE" SQL mode.
+			if (
+				0 === $i
+				|| WP_MySQL_Lexer::OPEN_PAR_SYMBOL === $token->id
+				|| WP_MySQL_Lexer::CLOSE_PAR_SYMBOL === $token->id
+				|| WP_MySQL_Lexer::OPEN_PAR_SYMBOL === $last_token_id
+				|| WP_MySQL_Lexer::CLOSE_PAR_SYMBOL === $last_token_id
+			) {
+				$value .= $token->get_bytes();
+			} else {
+				$value .= ' ' . $token->get_bytes();
+			}
+			$last_token_id = $token->id;
+		}
+		return $value;
 	}
 
 	/**

@@ -19,7 +19,7 @@ class WP_SQLite_Information_Schema_Reconstructor {
 	/**
 	 * The SQLite driver instance.
 	 *
-	 * @var WP_SQLite_Driver
+	 * @var WP_PDO_MySQL_On_SQLite
 	 */
 	private $driver;
 
@@ -40,11 +40,11 @@ class WP_SQLite_Information_Schema_Reconstructor {
 	/**
 	 * Constructor.
 	 *
-	 * @param WP_SQLite_Driver                     $driver         The SQLite driver instance.
+	 * @param WP_PDO_MySQL_On_SQLite               $driver         The SQLite driver instance.
 	 * @param WP_SQLite_Information_Schema_Builder $schema_builder The information schema builder instance.
 	 */
 	public function __construct(
-		WP_SQLite_Driver $driver,
+		$driver,
 		WP_SQLite_Information_Schema_Builder $schema_builder
 	) {
 		$this->driver         = $driver;
@@ -127,7 +127,7 @@ class WP_SQLite_Information_Schema_Reconstructor {
 		return $this->driver->execute_sqlite_query(
 			"
 				SELECT name
-				FROM sqlite_schema
+				FROM sqlite_master
 				WHERE type = 'table'
 				AND name != ?
 				AND name NOT LIKE ? ESCAPE '\'
@@ -137,7 +137,7 @@ class WP_SQLite_Information_Schema_Reconstructor {
 			array(
 				'_mysql_data_types_cache',
 				'sqlite\_%',
-				str_replace( '_', '\_', WP_SQLite_Driver::RESERVED_PREFIX ) . '%',
+				str_replace( '_', '\_', WP_PDO_MySQL_On_SQLite::RESERVED_PREFIX ) . '%',
 			)
 		)->fetchAll( PDO::FETCH_COLUMN );
 	}
@@ -367,7 +367,7 @@ class WP_SQLite_Information_Schema_Reconstructor {
 		$is_auto_increment = false;
 		if ( '0' !== $column_info['pk'] ) {
 			$is_auto_increment = $this->driver->execute_sqlite_query(
-				'SELECT 1 FROM sqlite_schema WHERE tbl_name = ? AND sql LIKE ?',
+				'SELECT 1 FROM sqlite_master WHERE tbl_name = ? AND sql LIKE ?',
 				array( $table_name, '%AUTOINCREMENT%' )
 			)->fetchColumn();
 
@@ -623,6 +623,72 @@ class WP_SQLite_Information_Schema_Reconstructor {
 			return null;
 		}
 
+		/**
+		 * Check whether the stored type value is a valid MySQL column type.
+		 *
+		 * Some older versions of the legacy SQLite driver might have stored
+		 * invalid MySQL column types in some scenarios:
+		 *
+		 *   1. Before https://github.com/WordPress/sqlite-database-integration/pull/126,
+		 *      the legacy SQLite driver incorrectly stored MySQL column types
+		 *      for columns with multiple type arguments.
+		 *
+		 *      E.g., a column definition like "col_name decimal(26, 8)" would
+		 *      be stored with invalid type "decimal(26,".
+		 *
+		 *   2. Before https://github.com/WordPress/sqlite-database-integration/commit/b5a9fbaed4d0d843f792aaa959e3d00f193ff1ee
+		 *      (see also https://github.com/Automattic/sqlite-database-integration/pull/2),
+		 *      the legacy SQLite driver incorrectly recognized indexes on columns
+		 *      with type keywords as additional table column definitions.
+		 *
+		 *      E.g., an index definition like "KEY timestamp (timestamp)" would
+		 *      be stored as column "KEY" with invalid type "timestamp(timestamp)".
+		 *
+		 * To address these issues, we need to check whether the stored type looks
+		 * like a valid MySQL column type definition.
+		 */
+		$open_par_index  = strpos( $mysql_type, '(' );
+		$close_par_index = strpos( $mysql_type, ')' );
+		if ( false !== $open_par_index ) {
+			$end   = false !== $close_par_index ? $close_par_index : strlen( $mysql_type );
+			$parts = explode( '(', substr( $mysql_type, 0, $end ) );
+			$type  = strtolower( trim( $parts[0] ) );
+			$args  = array();
+			foreach ( explode( ',', $parts[1] ) as $arg ) {
+				$args[] = strtolower( trim( $arg ) );
+			}
+
+			// WooCommerce uses decimal(26,8), decimal(19,4), and decimal(3,2)
+			// column types, so we can can fix the invalid column definitions.
+			$looks_like_wc_table = str_contains( $table_name, 'wc_' ) || str_contains( $table_name, 'woocommerce_' );
+			$is_invalid_decimal  = 'decimal' === $type && count( $args ) === 2 && '' === $args[1];
+			if ( $looks_like_wc_table && $is_invalid_decimal ) {
+				if ( '26' === $args[0] ) {
+					// Fix "decimal(26,".
+					return 'decimal(26,8)';
+				} elseif ( '19' === $args[0] ) {
+					// Fix "decimal(19,".
+					return 'decimal(19,4)';
+				} elseif ( '3' === $args[0] ) {
+					// Fix "decimal(3,".
+					return 'decimal(3,2)';
+				}
+			}
+
+			// Only numeric arguments are allowed for MySQL column types.
+			// This handles the incorrectly stored index definition case.
+			foreach ( $args as $arg ) {
+				if ( ! is_numeric( $arg ) ) {
+					return null;
+				}
+			}
+
+			// If there is no closing parenthesis, the type is invalid.
+			if ( false === $close_par_index ) {
+				return null;
+			}
+		}
+
 		// Normalize index type for backward compatibility. Some older versions
 		// of the SQLite driver stored index types with a " KEY" suffix, e.g.,
 		// "PRIMARY KEY" or "UNIQUE KEY". More recent versions omit the suffix.
@@ -692,9 +758,9 @@ class WP_SQLite_Information_Schema_Reconstructor {
 	/**
 	 * Format a MySQL UTF-8 string literal for output in a CREATE TABLE statement.
 	 *
-	 * See WP_SQLite_Driver::quote_mysql_utf8_string_literal().
+	 * See WP_PDO_MySQL_On_SQLite::quote_mysql_utf8_string_literal().
 	 *
-	 * TODO: This is a copy of WP_SQLite_Driver::quote_mysql_utf8_string_literal().
+	 * TODO: This is a copy of WP_PDO_MySQL_On_SQLite::quote_mysql_utf8_string_literal().
 	 *       We may consider extracing it to reusable MySQL helpers.
 	 *
 	 * @param  string $utf8_literal The UTF-8 string literal to escape.
