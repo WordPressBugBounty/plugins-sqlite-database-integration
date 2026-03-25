@@ -31,13 +31,6 @@ class WP_SQLite_DB extends wpdb {
 	private $allow_unsafe_unquoted_parameters = true;
 
 	/**
-	 * The application ID for the SQLite database.
-	 *
-	 * @see https://www.sqlite.org/pragma.html#pragma_application_id
-	 */
-	const SQLITE_DB_APPLICATION_ID = 3948349;
-
-	/**
 	 * Connects to the SQLite database.
 	 *
 	 * Unlike for MySQL, no credentials and host are needed.
@@ -314,18 +307,16 @@ class WP_SQLite_DB extends wpdb {
 			$pdo = $GLOBALS['@pdo'];
 		}
 
-		// Migrate the database file from the legacy default name (".ht.sqlite") to
-		// the new default name (".ht.sqlite.php"). This only runs when using the
-		// default file name and the new file does not already exist.
+		// Migrate the database file from a legacy path, if it exists.
 		if ( ! defined( 'DB_FILE' ) && ! file_exists( FQDB ) ) {
-			$old_db_path = FQDBDIR . '.ht.sqlite';
+			$old_db_path = FQDBDIR . '.ht.sqlite.php';
 
 			if ( file_exists( $old_db_path ) ) {
 				if ( ! rename( $old_db_path, FQDB ) ) {
 					wp_die( 'Failed to rename database file.', 'Error!' );
 				}
 
-				foreach ( array( '-wal', '-shm' ) as $suffix ) {
+				foreach ( array( '-wal', '-shm', '-journal' ) as $suffix ) {
 					if ( file_exists( $old_db_path . $suffix ) ) {
 						if ( ! rename( $old_db_path . $suffix, FQDB . $suffix ) ) {
 							wp_die( 'Failed to rename database file.', 'Error!' );
@@ -350,10 +341,9 @@ class WP_SQLite_DB extends wpdb {
 			try {
 				$connection      = new WP_SQLite_Connection(
 					array(
-						'pdo'            => $pdo,
-						'path'           => FQDB,
-						'journal_mode'   => defined( 'SQLITE_JOURNAL_MODE' ) ? SQLITE_JOURNAL_MODE : null,
-						'application_id' => self::SQLITE_DB_APPLICATION_ID,
+						'pdo'          => $pdo,
+						'path'         => FQDB,
+						'journal_mode' => defined( 'SQLITE_JOURNAL_MODE' ) ? SQLITE_JOURNAL_MODE : null,
 					)
 				);
 				$this->dbh       = new WP_SQLite_Driver( $connection, $this->dbname );
