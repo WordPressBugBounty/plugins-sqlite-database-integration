@@ -6,20 +6,22 @@
  */
 
 /**
- * SQLite information schema recconstructor for MySQL.
+ * SQLite information schema reconstructor for MySQL.
  *
  * This class checks and reconstructs the MySQL INFORMATION_SCHEMA data in SQLite
  * when it becomes out of sync with the actual SQLite database schema.
  *
- * Currently, it reconstructs schema infromation for missing tables, and removes
+ * Currently, it reconstructs schema information for missing tables, and removes
  * stale data for tables that no longer exist. When used with WordPress, it uses
  * the "wp_get_db_schema()" function to reconstruct WordPress table information.
+ *
+ * @access private
  */
 class WP_SQLite_Information_Schema_Reconstructor {
 	/**
 	 * The SQLite driver instance.
 	 *
-	 * @var WP_PDO_MySQL_On_SQLite
+	 * @var WP_MySQL_On_SQLite
 	 */
 	private $driver;
 
@@ -40,7 +42,7 @@ class WP_SQLite_Information_Schema_Reconstructor {
 	/**
 	 * Constructor.
 	 *
-	 * @param WP_PDO_MySQL_On_SQLite               $driver         The SQLite driver instance.
+	 * @param WP_MySQL_On_SQLite               $driver         The SQLite driver instance.
 	 * @param WP_SQLite_Information_Schema_Builder $schema_builder The information schema builder instance.
 	 */
 	public function __construct(
@@ -76,7 +78,7 @@ class WP_SQLite_Information_Schema_Reconstructor {
 					$sql = $this->generate_create_table_statement( $table );
 					$ast = $this->driver->create_parser( $sql )->parse();
 					if ( null === $ast ) {
-						throw new WP_SQLite_Driver_Exception( $this->driver, 'Failed to parse the MySQL query.' );
+						throw new WP_MySQL_On_SQLite_Exception( $this->driver, 'Failed to parse the MySQL query.' );
 					}
 				}
 
@@ -111,7 +113,7 @@ class WP_SQLite_Information_Schema_Reconstructor {
 		$sql = sprintf( 'DROP TABLE %s', $this->connection->quote_identifier( $table_name ) ); // TODO: mysql quote
 		$ast = $this->driver->create_parser( $sql )->parse();
 		if ( null === $ast ) {
-			throw new WP_SQLite_Driver_Exception( $this->driver, 'Failed to parse the MySQL query.' );
+			throw new WP_MySQL_On_SQLite_Exception( $this->driver, 'Failed to parse the MySQL query.' );
 		}
 		$this->schema_builder->record_drop_table(
 			$ast->get_first_descendant_node( 'dropStatement' )
@@ -137,7 +139,7 @@ class WP_SQLite_Information_Schema_Reconstructor {
 			array(
 				'_mysql_data_types_cache',
 				'sqlite\_%',
-				str_replace( '_', '\_', WP_PDO_MySQL_On_SQLite::RESERVED_PREFIX ) . '%',
+				str_replace( '_', '\_', WP_MySQL_On_SQLite::RESERVED_PREFIX ) . '%',
 			)
 		)->fetchAll( PDO::FETCH_COLUMN );
 	}
@@ -233,7 +235,7 @@ class WP_SQLite_Information_Schema_Reconstructor {
 		while ( $parser->next_query() ) {
 			$ast = $parser->get_query_ast();
 			if ( null === $ast ) {
-				throw new WP_SQLite_Driver_Exception( $this->driver, 'Failed to parse the MySQL query.' );
+				throw new WP_MySQL_On_SQLite_Exception( $this->driver, 'Failed to parse the MySQL query.' );
 			}
 
 			$create_node = $ast->get_first_descendant_node( 'createStatement' );
@@ -496,6 +498,11 @@ class WP_SQLite_Information_Schema_Reconstructor {
 		}
 		$mysql_type = strtolower( $mysql_type );
 
+		if ( str_starts_with( $mysql_type, 'bit' ) ) {
+			// BIT columns are stored as INTEGER in SQLite.
+			return "b'" . decbin( (int) $default_value ) . "'";
+		}
+
 		/*
 		 * In MySQL, geometry columns can't have a default value.
 		 *
@@ -567,9 +574,11 @@ class WP_SQLite_Information_Schema_Reconstructor {
 		}
 
 		// HEX literals (numeric). E.g.: 0x1a2f, 0X1A2F
-		$value = filter_var( $no_underscore_default_value, FILTER_VALIDATE_INT, FILTER_FLAG_ALLOW_HEX );
-		if ( false !== $value ) {
-			return $value;
+		if ( 1 === preg_match( '/^0[xX][0-9a-fA-F]+$/D', $no_underscore_default_value ) ) {
+			// Convert to signed 64-bit decimal text in SQLite to avoid PHP integer size limits.
+			return (string) $this->connection->query(
+				'SELECT CAST(' . $no_underscore_default_value . ' AS TEXT)'
+			)->fetchColumn();
 		}
 
 		// BLOB literals (string). E.g.: x'1a2f', X'1A2F'
@@ -758,10 +767,10 @@ class WP_SQLite_Information_Schema_Reconstructor {
 	/**
 	 * Format a MySQL UTF-8 string literal for output in a CREATE TABLE statement.
 	 *
-	 * See WP_PDO_MySQL_On_SQLite::quote_mysql_utf8_string_literal().
+	 * See WP_MySQL_On_SQLite::quote_mysql_utf8_string_literal().
 	 *
-	 * TODO: This is a copy of WP_PDO_MySQL_On_SQLite::quote_mysql_utf8_string_literal().
-	 *       We may consider extracing it to reusable MySQL helpers.
+	 * TODO: This is a copy of WP_MySQL_On_SQLite::quote_mysql_utf8_string_literal().
+	 *       We may consider extracting it to reusable MySQL helpers.
 	 *
 	 * @param  string $utf8_literal The UTF-8 string literal to escape.
 	 * @return string               The escaped string literal.
